@@ -13,14 +13,31 @@ const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
 $base = __DIR__ . '/storage';
 $uploadDir = $base . '/uploads';
 foreach ([$base, $uploadDir] as $dir) {
-    if (!is_dir($dir)) { @mkdir($dir, 0750, true); }
+    if (!is_dir($dir) && !@mkdir($dir, 0750, true) && !is_dir($dir)) {
+        http_response_code(500);
+        exit('Не удалось создать каталог хранилища. Проверьте права доступа.');
+    }
 }
-if (!file_exists($base . '/.htaccess')) {
-    @file_put_contents($base . '/.htaccess', "Require all denied\nDeny from all\n");
+if (!is_writable($base) || !is_writable($uploadDir)) {
+    http_response_code(500);
+    exit('Каталог хранилища недоступен для записи. Проверьте права доступа.');
+}
+$storageDeny = "Options -Indexes\n<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\nOrder allow,deny\nDeny from all\n</IfModule>\n";
+foreach ([$base . '/.htaccess', $uploadDir . '/.htaccess'] as $denyFile) {
+    if (!file_exists($denyFile) && @file_put_contents($denyFile, $storageDeny, LOCK_EX) === false) {
+        http_response_code(500);
+        exit('Не удалось защитить каталог хранилища.');
+    }
+}
+foreach ([$base . '/index.php', $uploadDir . '/index.php'] as $indexFile) {
+    if (!file_exists($indexFile) && @file_put_contents($indexFile, "<?php http_response_code(404); exit;\n", LOCK_EX) === false) {
+        http_response_code(500);
+        exit('Не удалось защитить каталог хранилища.');
+    }
 }
 if (session_status() !== PHP_SESSION_ACTIVE) {
     session_set_cookie_params([
-        'lifetime' => 0, 'path' => '/', 'secure' => !empty($_SERVER['HTTPS']),
+        'lifetime' => 0, 'path' => '/', 'secure' => (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off') || (int)($_SERVER['SERVER_PORT'] ?? 0) === 443,
         'httponly' => true, 'samesite' => 'Lax'
     ]);
     session_start();
@@ -34,17 +51,40 @@ function e(string $v): string { return htmlspecialchars($v, ENT_QUOTES | ENT_SUB
 function db(string $name, array $default = []): array {
     global $base;
     $path = $base . '/' . $name . '.json';
-    if (!file_exists($path)) { file_put_contents($path, json_encode($default, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE), LOCK_EX); }
-    $raw = file_get_contents($path);
-    $data = json_decode($raw ?: '', true);
-    return is_array($data) ? $data : $default;
+    if (!file_exists($path)) {
+        $initial = json_encode($default, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+        if (file_put_contents($path, $initial, LOCK_EX) === false) {
+            throw new RuntimeException('Не удалось создать файл данных: ' . $name);
+        }
+        @chmod($path, 0640);
+    }
+    $raw = @file_get_contents($path);
+    if ($raw === false) {
+        throw new RuntimeException('Не удалось прочитать файл данных: ' . $name);
+    }
+    try {
+        $data = json_decode($raw, true, 512, JSON_THROW_ON_ERROR);
+    } catch (JsonException $ex) {
+        throw new RuntimeException('Файл данных повреждён: ' . $name, 0, $ex);
+    }
+    if (!is_array($data)) {
+        throw new RuntimeException('Неверный формат файла данных: ' . $name);
+    }
+    return $data;
 }
 function save_db(string $name, array $data): void {
     global $base;
     $path = $base . '/' . $name . '.json';
-    $tmp = $path . '.tmp';
-    file_put_contents($tmp, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), LOCK_EX);
-    rename($tmp, $path);
+    $tmp = $path . '.' . bin2hex(random_bytes(6)) . '.tmp';
+    $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+    if (file_put_contents($tmp, $json, LOCK_EX) === false) {
+        throw new RuntimeException('Не удалось записать файл данных: ' . $name);
+    }
+    @chmod($tmp, 0640);
+    if (!@rename($tmp, $path)) {
+        @unlink($tmp);
+        throw new RuntimeException('Не удалось сохранить файл данных: ' . $name);
+    }
 }
 function csrf(): string {
     if (empty($_SESSION['csrf'])) { $_SESSION['csrf'] = bin2hex(random_bytes(32)); }
@@ -62,13 +102,25 @@ function notice(string $type, string $message): void { $_SESSION['notice'] = [$t
 function go(string $page = 'home'): never { header('Location: ?page=' . rawurlencode($page)); exit; }
 function make_id(): string { return strtoupper(bin2hex(random_bytes(4))); }
 
+$page = (string)($_GET['page'] ?? 'home');
+$dbLock = null;
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $dbLock = @fopen($base . '/.write.lock', 'c');
+    if (!$dbLock || !flock($dbLock, LOCK_EX)) {
+        http_response_code(503);
+        exit('Хранилище временно занято. Повторите запрос.');
+    }
+}
 $users = db('users');
 $apps = db('applications');
 $reports = db('reports');
 $scans = db('scans');
 $settings = db('settings', ['site_title' => APP_NAME, 'maintenance' => false]);
+$hasAdmin = false;
+foreach ($users as $storedUser) {
+    if (($storedUser['role'] ?? '') === 'admin') { $hasAdmin = true; break; }
+}
 $user = current_user();
-$page = (string)($_GET['page'] ?? 'home');
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     verify_csrf();
@@ -80,21 +132,48 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (mb_strlen($name) < 2 || !filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($password) < 8) {
             notice('error', 'Проверьте имя, email и пароль (не менее 8 символов).'); go('register');
         }
-        foreach ($users as $u) if (mb_strtolower($u['email']) === $email) { notice('error', 'Этот email уже зарегистрирован.'); go('register'); }
+        foreach ($users as $u) if (mb_strtolower((string)($u['email'] ?? '')) === $email) { notice('error', 'Этот email уже зарегистрирован.'); go('register'); }
         $users[] = ['id'=>bin2hex(random_bytes(16)), 'name'=>$name, 'email'=>$email, 'password'=>password_hash($password, PASSWORD_DEFAULT), 'role'=>'user', 'created'=>date(DATE_ATOM)];
         save_db('users', $users); notice('success', 'Аккаунт создан. Теперь войдите.'); go('login');
     }
     if ($action === 'login') {
         $email = mb_strtolower(trim((string)($_POST['email'] ?? '')));
         $password = (string)($_POST['password'] ?? '');
-        foreach ($users as $u) {
-            if (mb_strtolower($u['email']) === $email && password_verify($password, $u['password'])) {
-                session_regenerate_id(true); $_SESSION['uid'] = $u['id']; notice('success', 'Вы вошли в аккаунт.'); go('account');
+        $lockedUntil = (int)($_SESSION['login_locked_until'] ?? 0);
+        if ($lockedUntil > time()) {
+            notice('error', 'Слишком много попыток входа. Подождите 15 минут.');
+            go('login');
+        }
+        foreach ($users as $index => $u) {
+            if (mb_strtolower((string)($u['email'] ?? '')) === $email && password_verify($password, (string)($u['password'] ?? ''))) {
+                unset($_SESSION['login_attempts'], $_SESSION['login_locked_until']);
+                if (password_needs_rehash($u['password'], PASSWORD_DEFAULT)) {
+                    $users[$index]['password'] = password_hash($password, PASSWORD_DEFAULT);
+                    save_db('users', $users);
+                }
+                session_regenerate_id(true);
+                $_SESSION['uid'] = $u['id'];
+                notice('success', 'Вы вошли в аккаунт.');
+                go('account');
             }
         }
-        notice('error', 'Неверный email или пароль.'); go('login');
+        $attempts = (int)($_SESSION['login_attempts'] ?? 0) + 1;
+        if ($attempts >= 5) {
+            $_SESSION['login_attempts'] = 0;
+            $_SESSION['login_locked_until'] = time() + 900;
+            notice('error', 'Слишком много попыток входа. Доступ временно ограничен на 15 минут.');
+        } else {
+            $_SESSION['login_attempts'] = $attempts;
+            notice('error', 'Неверный email или пароль.');
+        }
+        go('login');
     }
-    if ($action === 'logout') { $_SESSION = []; session_regenerate_id(true); notice('success', 'Вы вышли из аккаунта.'); go(); }
+    if ($action === 'logout') {
+        $_SESSION = [];
+        session_regenerate_id(true);
+        notice('success', 'Вы вышли из аккаунта.');
+        go();
+    }
     if ($action === 'application' && $user) {
         $topic = trim((string)($_POST['topic'] ?? ''));
         $body = trim((string)($_POST['body'] ?? ''));
@@ -103,6 +182,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         save_db('applications', $apps); notice('success', 'Заявка отправлена.'); go('account');
     }
     if ($action === 'admin_setup') {
+        if ($hasAdmin) { notice('error', 'Администратор уже создан.'); go('login'); }
         $key = (string)($_POST['setup_key'] ?? '');
         if (ADMIN_SETUP_KEY === 'CHANGE-THIS-TO-A-LONG-RANDOM-SECRET' || !hash_equals(ADMIN_SETUP_KEY, $key)) {
             notice('error', 'Сначала измените ADMIN_SETUP_KEY в index.php на свой секретный ключ.'); go('setup');
@@ -110,8 +190,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $email = mb_strtolower(trim((string)($_POST['email'] ?? '')));
         $password = (string)($_POST['password'] ?? '');
         if (!filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($password) < 12) { notice('error', 'Нужен корректный email и пароль от 12 символов.'); go('setup'); }
-        foreach ($users as &$u) if (($u['role'] ?? '') === 'admin') { notice('error', 'Администратор уже создан.'); go('login'); }
-        unset($u);
         $users[] = ['id'=>bin2hex(random_bytes(16)), 'name'=>'Администратор', 'email'=>$email, 'password'=>password_hash($password, PASSWORD_DEFAULT), 'role'=>'admin', 'created'=>date(DATE_ATOM)];
         save_db('users', $users); notice('success', 'Администратор создан. Войдите в систему.'); go('login');
     }
@@ -135,7 +213,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'scan' && $user) {
         if (empty($_FILES['file']) || $_FILES['file']['error'] !== UPLOAD_ERR_OK) { notice('error', 'Не удалось загрузить файл.'); go('scanner'); }
         $f = $_FILES['file'];
-        if ($f['size'] > MAX_UPLOAD_BYTES || $f['size'] < 1 || !is_uploaded_file($f['tmp_name'])) { notice('error', 'Файл пустой или превышает лимит 5 МБ.'); go('scanner'); }
+        $actualSize = is_uploaded_file($f['tmp_name']) ? (int)filesize($f['tmp_name']) : 0;
+        if ($actualSize > MAX_UPLOAD_BYTES || $actualSize < 1 || !is_uploaded_file($f['tmp_name'])) { notice('error', 'Файл пустой или превышает лимит 5 МБ.'); go('scanner'); }
         $original = basename((string)$f['name']);
         $mime = (new finfo(FILEINFO_MIME_TYPE))->file($f['tmp_name']) ?: 'unknown';
         $hash = hash_file('sha256', $f['tmp_name']);
@@ -145,7 +224,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $ext = strtolower(pathinfo($original, PATHINFO_EXTENSION));
         if (in_array($ext, ['php','phtml','phar','exe','bat','cmd','scr','js'], true)) $signals[] = 'Потенциально исполняемый тип файла';
         $result = $signals ? 'Требует проверки' : 'Явных признаков не найдено';
-        $scan = ['id'=>make_id(), 'user_id'=>$user['id'], 'filename'=>$original, 'mime'=>$mime, 'size'=>(int)$f['size'], 'sha256'=>$hash, 'signals'=>$signals, 'result'=>$result, 'created'=>date(DATE_ATOM)];
+        $scan = ['id'=>make_id(), 'user_id'=>$user['id'], 'filename'=>$original, 'mime'=>$mime, 'size'=>$actualSize, 'sha256'=>$hash, 'signals'=>$signals, 'result'=>$result, 'created'=>date(DATE_ATOM)];
         $scans[] = $scan; save_db('scans', $scans);
         notice('success', 'Проверка завершена: ' . $result . '. Это базовая эвристическая проверка, не гарантия безопасности.');
         go('scanner');
@@ -172,6 +251,7 @@ case 'register':
 case 'login':
     echo '<div class="card"><h1>Вход</h1><form method="post"><input type="hidden" name="csrf" value="'.e(csrf()).'"><input type="hidden" name="action" value="login"><label>Email</label><input type="email" name="email" required><label>Пароль</label><input type="password" name="password" required><button>Войти</button></form></div>'; break;
 case 'setup':
+    if ($hasAdmin) { echo '<div class="card"><h1>Настройка уже завершена</h1><p>Администратор уже создан. Войдите в аккаунт.</p><a class="btn" href="?page=login">Войти</a></div>'; break; }
     echo '<div class="card"><h1>Первичная настройка администратора</h1><p class="muted">Сначала откройте index.php и замените ADMIN_SETUP_KEY на длинный случайный секрет. После этого заполните форму.</p><form method="post"><input type="hidden" name="csrf" value="'.e(csrf()).'"><input type="hidden" name="action" value="admin_setup"><label>Секретный ключ настройки</label><input type="password" name="setup_key" required><label>Email администратора</label><input type="email" name="email" required><label>Пароль (не менее 12 символов)</label><input type="password" name="password" minlength="12" required><button>Создать администратора</button></form></div>'; break;
 case 'account':
     if (!$user) { echo '<div class="card"><h1>Войдите в аккаунт</h1><a class="btn" href="?page=login">Войти</a></div>'; break; }
